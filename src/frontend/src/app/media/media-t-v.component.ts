@@ -1,9 +1,10 @@
-import { Component, OnInit, ViewChild } from '@angular/core';
+import { ChangeDetectorRef } from '@angular/core';
+import { Component, OnInit, OnDestroy, ViewChild } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
 import { ApiService } from '../api.service';
 import { ToastrService } from 'ngx-toastr';
 import * as _ from 'lodash';
-import { forkJoin, Observable } from 'rxjs';
+import {forkJoin, Observable, Subscription} from 'rxjs';
 import { catchError, tap } from 'rxjs/operators';
 import { NgbTabset } from '@ng-bootstrap/ng-bootstrap';
 
@@ -13,7 +14,7 @@ import { NgbTabset } from '@ng-bootstrap/ng-bootstrap';
   templateUrl: './media-t-v.component.html',
   styleUrls: ['./media-t-v.component.css']
 })
-export class MediaTVComponent implements OnInit {
+export class MediaTVComponent implements OnInit, OnDestroy {
   @ViewChild('tabsetEl') tabsetEl: NgbTabset;
   public result: any;
   public isManuallySearching = false;
@@ -26,11 +27,14 @@ export class MediaTVComponent implements OnInit {
   public isLoading = true;
   public isSaving = false;
 
+  protected _changes: Subscription;
+
   constructor(
     private route: ActivatedRoute,
     private apiService: ApiService,
     private toastr: ToastrService,
-    ) {
+    private changeDetectorRef: ChangeDetectorRef
+  ) {
   }
 
   ngOnInit() {
@@ -45,6 +49,18 @@ export class MediaTVComponent implements OnInit {
         this.toastr.error('An unknown error occurred');
       }
     );
+
+    // watch for updated media
+    this._changes = this.apiService.mediaUpdated$.subscribe(
+      () => {
+        this._buildWatchOptions();
+        this.changeDetectorRef.detectChanges();
+      }
+    );
+  }
+
+  ngOnDestroy() {
+    this._changes.unsubscribe();
   }
 
   public submitForSeason(seasonNumber: number) {
@@ -75,9 +91,9 @@ export class MediaTVComponent implements OnInit {
         }
       );
     } else {
-        for (const season of this.result.seasons) {
-          this.watchEntireSeason(season);
-        }
+      for (const season of this.result.seasons) {
+        this.watchEntireSeason(season);
+      }
     }
   }
 
@@ -93,20 +109,20 @@ export class MediaTVComponent implements OnInit {
       );
     } else {
 
-        const watchTvShow = this._getWatchShow();
+      const watchTvShow = this._getWatchShow();
 
-        this.apiService.watchTVSeason(watchTvShow.id, season.season_number).subscribe(
-          (data) => {
-            this.isSaving = false;
-            this.toastr.success(`Watching season ${season.season_number}`);
-            this._buildWatchOptions();
-          },
-          (error) => {
-            this.isSaving = false;
-            this.toastr.error('An unknown error occurred');
-            console.log(error);
-          }
-        );
+      this.apiService.watchTVSeasonRequest(watchTvShow.id, season.season_number).subscribe(
+        (data) => {
+          this.isSaving = false;
+          this.toastr.success(`Watching season ${season.season_number}`);
+          this._buildWatchOptions();
+        },
+        (error) => {
+          this.isSaving = false;
+          this.toastr.error('An unknown error occurred');
+          console.log(error);
+        }
+      );
     }
   }
 
@@ -115,15 +131,20 @@ export class MediaTVComponent implements OnInit {
   }
 
   public stopWatchingShow() {
+
     const watchShow = this._getWatchShow();
+
     if (watchShow) {
+      this.isSaving = true;
       this.apiService.unWatchTVShow(watchShow.id).subscribe(
         (data) => {
           this.toastr.success('Stopped watching show');
           this._buildWatchOptions();
+          this.isSaving = false;
         },
         (error) => {
           this.toastr.error('An unknown error occurred');
+          this.isSaving = false;
         }
       );
     }
@@ -147,19 +168,63 @@ export class MediaTVComponent implements OnInit {
     return Boolean(watchSeasonRequest);
   }
 
+  public hasCollectedAllEpisodesInSeason(season: any) {
+    // watching entire season
+    if (this.hasCollectedSeason(season)) {
+      return true;
+    }
+
+    // verify every episode is collected
+    for (const episode of season.episodes) {
+      const watchEpisode = this._getWatchEpisode(episode.id);
+      if (!watchEpisode || !watchEpisode.collected) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  public isWatchingAllEpisodesInSeason(season: any) {
+    // watching all episodes in season
+    let watchingEpisodes = 0;
+    for (const episode of season.episodes) {
+      if (this.isWatchingEpisode(episode.id)) {
+        watchingEpisodes += 1;
+      }
+    }
+    return season.episodes.length === watchingEpisodes;
+  }
+
+  public isWatchingAnyEpisodeInSeason(season: any) {
+    for (const episode of season.episodes) {
+      if (this.isWatchingEpisode(episode.id)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public hasCollectedSeason(season): boolean {
+    const watchSeason = this._getWatchSeason(season.season_number);
+    return watchSeason && watchSeason.collected;
+  }
+
   public stopWatchingEntireSeason(season: any) {
     const watchSeasonRequest = this._getWatchSeasonRequest(season.season_number);
     if (watchSeasonRequest) {
-        this.apiService.unWatchTVSeason(watchSeasonRequest.id).subscribe(
-          (data) => {
-            this.toastr.success(`Stopped watching ${this.result.name} - Season ${watchSeasonRequest.season_number}`);
-            this._buildWatchOptions();
-          },
-          (error) => {
-            console.error(error);
-            this.toastr.error('An unknown error occurred');
-          }
-        );
+      this.isSaving = true;
+      this.apiService.unWatchTVSeason(watchSeasonRequest.id).subscribe(
+        (data) => {
+          this.toastr.success(`Stopped watching ${this.result.name} - Season ${watchSeasonRequest.season_number}`);
+          this._buildWatchOptions();
+          this.isSaving = false;
+        },
+        (error) => {
+          console.error(error);
+          this.toastr.error('An unknown error occurred');
+          this.isSaving = false;
+        }
+      );
     }
   }
 

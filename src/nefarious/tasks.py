@@ -5,12 +5,14 @@ from celery.signals import task_failure
 from datetime import datetime
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_date
+
 from nefarious.celery import app
 from nefarious.models import NefariousSettings, WatchMovie, WatchTVEpisode, WatchTVSeason, WatchTVSeasonRequest
 from nefarious.processors import WatchMovieProcessor, WatchTVEpisodeProcessor, WatchTVSeasonProcessor
 from nefarious.tmdb import get_tmdb_client
 from nefarious.transmission import get_transmission_client
-from nefarious.utils import get_renamed_torrent
+from nefarious.utils import get_media_new_path_and_name
+from nefarious import websocket
 
 app.conf.beat_schedule = {
     'Completed Media Task': {
@@ -152,32 +154,32 @@ def completed_media_task():
                         season_request.collected = True
                         season_request.save()
 
-                    # delete any individual episodes now that we have the whole season
-                    for episode in WatchTVEpisode.objects.filter(watch_tv_show=media.watch_tv_show, season_number=media.season_number):
-                        episode.delete()
-
-                # rename the torrent file/path
-                renamed_torrent_name = get_renamed_torrent(torrent, media)
-                logging.info('Renaming torrent file from "{}" to "{}"'.format(torrent.name, renamed_torrent_name))
-                transmission_client.rename_torrent_path(torrent.id, torrent.name, renamed_torrent_name)
-
-                # move data from staging path to actual complete path
-                dir_name = (
+                # get the sub path (ie. "movies/", "tv/') so we can move the data from staging
+                sub_path = (
                     nefarious_settings.transmission_movie_download_dir if isinstance(media, WatchMovie)
                     else nefarious_settings.transmission_tv_download_dir
                 ).lstrip('/')
 
-                # define parent directory if it's just a single file
-                if len(torrent.files()) == 1:
-                    dir_name = os.path.join(dir_name, str(media))
+                # get the path and updated name for the data
+                new_path, new_name = get_media_new_path_and_name(media, torrent.name, len(torrent.files()) == 1)
 
+                # move the data
                 transmission_session = transmission_client.session_stats()
                 move_to_path = os.path.join(
                     transmission_session.download_dir,
-                    dir_name,
+                    sub_path,
+                    new_path or '',
                 )
                 logging.info('Moving torrent data to "{}"'.format(move_to_path))
                 torrent.move_data(move_to_path)
+
+                # rename the data
+                logging.info('Renaming torrent file from "{}" to "{}"'.format(torrent.name, new_name))
+                transmission_client.rename_torrent_path(torrent.id, torrent.name, new_name)
+
+                # send websocket message media was updated
+                media_type, data = websocket.get_media_type_and_serialized_watch_media(media)
+                websocket.send_message(websocket.ACTION_UPDATED, media_type, data)
 
 
 @app.task
@@ -226,23 +228,25 @@ def wanted_tv_season_task():
         season = season_request.info()
 
         now = datetime.utcnow()
-        last_air_date = parse_date(season['air_date'])  # season air date
+        last_air_date = parse_date(season['air_date'] or '')  # season air date
 
         # otherwise add any new episodes to our watch list
         for episode in season['episodes']:
-            episode_air_date = parse_date(episode['air_date'])
-            last_air_date = episode_air_date if episode_air_date > last_air_date else last_air_date
+
+            if episode['air_date'] is not None:
+                episode_air_date = parse_date(episode['air_date'])
+                last_air_date = episode_air_date if not last_air_date or episode_air_date > last_air_date else last_air_date
+
             watch_tv_episode, was_created = WatchTVEpisode.objects.get_or_create(
-                tmdb_episode_id=episode['id'],
+                watch_tv_show=tv_season_request.watch_tv_show,
+                season_number=tv_season_request.season_number,
+                episode_number=episode['episode_number'],
                 defaults=dict(
                     # add non-unique constraint fields for the default values
-                    watch_tv_show=tv_season_request.watch_tv_show,
-                    season_number=tv_season_request.season_number,
-                    episode_number=episode['episode_number'],
+                    tmdb_episode_id=episode['id'],
                     user=tv_season_request.user,
                 ))
             if was_created:
-                watch_tv_episode.save()
 
                 logging.info('adding newly found episode {} for {}'.format(episode['episode_number'], tv_season_request))
 
@@ -250,7 +254,7 @@ def wanted_tv_season_task():
                 tasks.append(watch_tv_episode_task.si(watch_tv_episode.id))
 
         # assume there's no new episodes for anything that's aired this long ago
-        days_since_aired = (now.date() - last_air_date).days
+        days_since_aired = (now.date() - last_air_date).days if last_air_date else 0
         if days_since_aired > 30:
             logging.warning('completing old tv season request {}'.format(tv_season_request))
             tv_season_request.collected = True
@@ -258,3 +262,8 @@ def wanted_tv_season_task():
 
     # execute tasks sequentially
     chain(*tasks)()
+
+
+@app.task
+def send_websocket_message_task(action: str, media_type: str, data: dict):
+    websocket.send_message(action, media_type, data)
